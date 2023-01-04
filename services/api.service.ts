@@ -1,15 +1,27 @@
 import type { Context, ServiceSchema } from "moleculer";
 import type { ApiSettingsSchema, GatewayResponse, IncomingRequest, Route } from "moleculer-web";
 import ApiGateway from "moleculer-web";
+import AppMixin from "../mixins/app.mixin";
+import {Service} from "moleculer";
+import app from "../src/app";
+import { serialize } from 'cookie';
+import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import cors from "cors";
+import versionMiddleware from "../middlewares/version.middleware";
+
+import languageParser from "accept-language-parser";
 
 interface Meta {
 	userAgent?: string | null | undefined;
-	user?: object | null | undefined;
+	user?: {id: string, username: string, roles: Map<string, string>} | null | undefined; // User ctonaints Locale - use this and locale down below as fallback, use then application and then system as fallback locale
+	locale?: object | null | undefined; // Accept Header locale
+	version?: object | null | undefined; // X-Target-Version header
 }
 
 const ApiService: ServiceSchema<ApiSettingsSchema> = {
 	name: "api",
-	mixins: [ApiGateway],
+	mixins: [ApiGateway, AppMixin()],
 
 	// More info about settings: https://moleculer.services/docs/0.14/moleculer-web.html
 	settings: {
@@ -19,8 +31,20 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 		// Exposed IP
 		ip: "0.0.0.0",
 
+		version: {
+			min: "0.0.0",
+			source: "1.0.0",
+		},
+
 		// Global Express middlewares. More info: https://moleculer.services/docs/0.14/moleculer-web.html#Middlewares
-		use: [],
+		use: [
+			// @ts-ignore
+			cookieParser(),
+			helmet(),
+			cors(),
+			// @ts-ignore
+			versionMiddleware,
+		],
 
 		routes: [
 			{
@@ -38,17 +62,19 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 				authentication: false,
 
 				// Enable authorization. Implement the logic into `authorize` method. More info: https://moleculer.services/docs/0.14/moleculer-web.html#Authorization
-				authorization: false,
+				authorization: true,
 
 				// The auto-alias feature allows you to declare your route alias directly in your services.
 				// The gateway will dynamically build the full routes from service schema.
 				autoAliases: true,
 
-				aliases: {},
+				aliases: {
+					"GET ping": "api.ping",
+				},
 
 				/**
 				 * Before call hook. You can check the request.
-				 *
+				 */
 				onBeforeCall(
 					ctx: Context<unknown, Meta>,
 					route: Route,
@@ -57,22 +83,62 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 				): void {
 					// Set request headers to context meta
 					ctx.meta.userAgent = req.headers["user-agent"];
-				}, */
+				},
 
 				/**
 				 * After call hook. You can modify the data.
-				 *
+				 */
 				onAfterCall(
 					ctx: Context,
 					route: Route,
 					req: IncomingRequest,
 					res: GatewayResponse,
-					data: unknown,
-				): unknown {
-					// Async function which return with Promise
-					// return this.doSomething(ctx, res, data);
+					data: any,
+				): any {
+
+					// @ts-ignore
+					const responseHeader: any = ctx.meta["$responseHeader"];
+					if (responseHeader != null) {
+						for (const [key, value] of Object.entries(responseHeader)) {
+							res.setHeader(key, Array.isArray(value) ? value : String(value));
+						}
+					}
+
+					// @ts-ignore
+					/*
+					const responseCookies: any = ctx.meta["$responseCookies"];
+					if (Array.isArray(responseCookies) && responseCookies.length != 0) {
+						res.setHeader("Set-Cookie", responseCookies);
+					}
+					if (responseCookies != null) {
+						let cookies: any[] = [];
+						for (const [key, value] of Object.entries(responseCookies)) {
+							if (value != null) {
+								cookies.push(serialize(key, String(value), {
+									httpOnly: true,
+									secure: process.env.NODE_ENV === 'production',
+									sameSite: 'strict',
+									maxAge: 60 * 60 * 24 * 30,
+									path: '/',
+								}));
+							} else {
+
+								// @ts-ignore
+								cookies.push(serialize(key, null, {
+									httpOnly: true,
+									secure: process.env.NODE_ENV === 'production',
+									sameSite: 'strict',
+									maxAge: -1,
+									path: '/',
+								}));
+							}
+						}
+
+					}
+					 */
+
 					return data;
-				}, */
+				},
 
 				// Calling options. More info: https://moleculer.services/docs/0.14/moleculer-web.html#Calling-options
 				callingOptions: {},
@@ -92,7 +158,7 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 				mappingPolicy: "all", // Available values: "all", "restrict"
 
 				// Enable/disable logging
-				logging: true,
+				logging: false,
 			},
 		],
 
@@ -109,6 +175,23 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 
 			// Options to `server-static` module
 			options: {},
+		},
+	},
+
+	actions: {
+		ping: {
+			auth: false,
+			deprecated: {
+				since: "",
+				forRemoval: false,
+			},
+			rest: {
+				method: "GET",
+				path: "/ping",
+			},
+			handler(ctx: Context): string {
+				return 'pong';
+			},
 		},
 	},
 
@@ -153,14 +236,32 @@ const ApiService: ServiceSchema<ApiSettingsSchema> = {
 		 *
 		 * PLEASE NOTE, IT'S JUST AN EXAMPLE IMPLEMENTATION. DO NOT USE IN PRODUCTION!
 		 */
-		authorize(ctx: Context<null, Meta>, route: Route, req: IncomingRequest) {
+		authorize(ctx: Context<null, Meta>, route: Route, req: IncomingRequest): Promise<Context<null, Meta>> {
 			// Get the authenticated user.
 			const { user } = ctx.meta;
 
-			// It check the `auth` property in action schema.
-			if (req.$action.auth === "required" && !user) {
-				throw new ApiGateway.Errors.UnAuthorizedError("NO_RIGHTS", null);
+
+			// TODO, if auth check if auth and in future check authorization if authorized
+			this.logger.info('auth: ', req.$action.auth);
+			this.logger.info('params: ', req.$params);
+
+			const languages: languageParser.Language[] = languageParser.parse(req.headers["accept-language"]);
+			if (languages.length !== 0) {
+				ctx.meta.locale = {language: languages[0].code, country: languages[0].region};
+				this.logger.info("lang: ", languages[0].code, languages[0].region);
+			} else {
+				ctx.meta.locale = {language: "en", country: "US"};
 			}
+
+			// @ts-ignore
+			if (Object.keys(req["cookies"]).length !== 0) this.logger.info('cookies: ', req["cookies"]);
+
+			return Promise.resolve(ctx);
+
+			// It check the `auth` property in action schema.
+			//if (req.$action.auth === "required" && !user) {
+			//	throw new ApiGateway.Errors.UnAuthorizedError("NO_RIGHTS", null);
+			//}
 		},
 	},
 };
